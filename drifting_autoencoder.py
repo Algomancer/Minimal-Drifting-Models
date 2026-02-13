@@ -166,39 +166,64 @@ def normalize_drift(V: Tensor, target_variance: float = 1.0) -> Tensor:
 def compute_drift(
     x: Tensor,
     y_pos: Tensor,
+    y_neg: Tensor,
     temps: tuple[float, ...] = (0.02, 0.05, 0.2),
 ) -> Tensor:
     """
-    Multi-temperature mean-shift drifting field.  y_neg = x always.
+    Multi-temperature mean-shift drifting field with explicit negative samples.
+
+    Uses doubly-normalized softmax (geometric mean of row/col softmax) over
+    concatenated positive and negative affinities, then factorized weights
+    to compute V = W_pos @ y_pos - W_neg @ y_neg.
 
     Each per-temperature V is normalized so E[||V||^2] ~ 1 before summing.
     Final V is also normalized to target variance.
 
     Args:
-        x:     Query points / negative samples [N, D]
+        x:     Query points [N, D]
         y_pos: Positive (target) samples [N_pos, D]
+        y_neg: Negative (current distribution) samples [N_neg, D]
         temps: Kernel temperatures to average over
 
     Returns:
         V_norm: Normalized drift vectors [N, D]
     """
+    N, N_pos, N_neg = x.shape[0], y_pos.shape[0], y_neg.shape[0]
+
     # normalize for kernel computation — use x's stats for all
     x_n, mean, std, scale, _ = normalize_features(x)
     y_pos_n, _, _, _, _ = normalize_features(y_pos, mean=mean, std=std, scale=scale)
+    y_neg_n, _, _, _, _ = normalize_features(y_neg, mean=mean, std=std, scale=scale)
 
     dist_pos = torch.cdist(x_n, y_pos_n)                          # [N, N_pos]
+    dist_neg = torch.cdist(x_n, y_neg_n)                          # [N, N_neg]
+
+    # mask self-interactions (y_neg = x in standard usage)
+    if N == N_neg:
+        dist_neg = dist_neg + torch.eye(N, device=x.device) * 1e6
 
     V = torch.zeros_like(x)
     for temp in temps:
-        logit = -dist_pos / temp
+        logit = torch.cat([
+            -dist_pos / temp,
+            -dist_neg / temp,
+        ], dim=1)                                                  # [N, N_pos + N_neg]
 
-        # Sinkhorn: doubly-stochastic transport plan (positive only)
+        # Sinkhorn: doubly-stochastic transport plan over pos+neg
         for _ in range(10):
             logit = logit - logit.logsumexp(dim=-1, keepdim=True)
             logit = logit - logit.logsumexp(dim=-2, keepdim=True)
-        P = logit.exp()                                            # [N, N_pos]
+        A = logit.exp()                                            # [N, N_pos + N_neg]
 
-        V_tau = P @ y_pos - x
+        A_pos = A[:, :N_pos]                                       # [N, N_pos]
+        A_neg = A[:, N_pos:]                                       # [N, N_neg]
+
+        # factorized weights
+        W_pos = A_pos * A_neg.sum(dim=1, keepdim=True)
+        W_neg = A_neg * A_pos.sum(dim=1, keepdim=True)
+
+        # displacement in original (un-normalized) space
+        V_tau = W_pos @ y_pos - W_neg @ y_neg
 
         # normalize each temperature's V so E[||V||^2] ~ 1
         V_norm = torch.sqrt(torch.mean(V_tau ** 2) + 1e-8)
@@ -221,7 +246,7 @@ def drifting_loss(
     temps: tuple[float, ...] = (0.02, 0.05, 0.2),
 ) -> Tensor:
     """
-    Compute per-sample drifting loss.
+    Compute per-sample drifting loss.  y_neg = x (current distribution).
 
     Args:
         x:     Current samples [N, D] (with gradient)
@@ -232,7 +257,7 @@ def drifting_loss(
         loss: Per-sample loss [N]
     """
     with torch.no_grad():
-        V_norm = compute_drift(x, y_pos, temps=temps)
+        V_norm = compute_drift(x, y_pos, x, temps=temps)
         target = (x + V_norm).detach()
     return ((x - target) ** 2).sum(dim=-1)
 
@@ -422,4 +447,3 @@ if __name__ == "__main__":
     viz_2d_data(model2.decode(torch.randn(4096, 2, device=DEVICE)),
                 filename="final_generated_checker.jpg", title="Generated")
 
-    print("Done.")
