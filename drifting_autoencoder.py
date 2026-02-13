@@ -185,6 +185,7 @@ def compute_drift(
     """
     N, N_pos = x.shape[0], y_pos.shape[0]
 
+    
     # pairwise L2 distances
     dist_pos = torch.cdist(x, y_pos)                   # [N, N_pos]
     dist_neg = torch.cdist(x, y_neg)                    # [N, N_neg]
@@ -234,17 +235,28 @@ def drifting_loss(
     """
     Compute per-sample drifting loss.  y_neg = x (current distribution).
 
+    Features are normalized (Sec A.6) before kernel computation so that
+    temperature is independent of raw feature magnitude.  Drift is mapped
+    back to original space and variance-normalized.
+
     Args:
         x:     Current samples [N, D] (with gradient)
         y_pos: Target samples [N_pos, D]
-        temps: Kernel temperatures
 
     Returns:
         loss: Per-sample loss [N]
     """
     with torch.no_grad():
-        V_norm = compute_drift(x, y_pos, x)
-        target = (x + V_norm).detach()
+        # normalize using x's statistics for all distributions
+        x_n, mean, std, scale, _ = normalize_features(x)
+        yp_n, _, _, _, _ = normalize_features(y_pos, mean=mean, std=std, scale=scale)
+        yn_n, _, _, _, _ = normalize_features(x, mean=mean, std=std, scale=scale)
+
+        V = compute_drift(x_n, yp_n, yn_n)
+
+        # map drift back to original space, normalize variance
+        V_orig = normalize_drift(V / scale * std)
+        target = (x + V_orig).detach()
     return ((x - target) ** 2).sum(dim=-1)
 
 
